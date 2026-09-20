@@ -95,6 +95,21 @@ function M.worktree_prune(cwd)
   return M.run(cwd, { "worktree", "prune" })
 end
 
+function M.worktree_paths(cwd)
+  local result = M.run(cwd, { "worktree", "list", "--porcelain" })
+  if result.code ~= 0 or result.stdout == "" then
+    return {}
+  end
+  local paths = {}
+  for line in result.stdout:gmatch("[^\n]+") do
+    local path = line:match("^worktree (.+)$")
+    if path then
+      table.insert(paths, util.normalize(path))
+    end
+  end
+  return paths
+end
+
 function M.delete_branch(cwd, branch)
   return M.run(cwd, { "branch", "-D", branch })
 end
@@ -104,7 +119,7 @@ function M.delete_tag(cwd, tag)
 end
 
 function M.create_tag(cwd, tag, sha)
-  return M.run(cwd, { "tag", "-f", tag, sha })
+  return M.run(cwd, { "tag", tag, sha })
 end
 
 function M.merge_squash(cwd, source_sha)
@@ -145,7 +160,7 @@ function M.intent_to_add(cwd, paths)
   end
   local batch_size = 100
   for i = 1, #paths, batch_size do
-    local args = { "add", "-N", "--" }
+    local args = { "--literal-pathspecs", "add", "-N", "--" }
     for j = i, math.min(i + batch_size - 1, #paths) do
       table.insert(args, paths[j])
     end
