@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test Git review workflow
+        run: bash tests/workflow.sh
+
+      - name: Install Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          version: stable
+          neovim: true
+
+      - name: Smoke-test plugin load
+        run: |
+          nvim --headless -u NONE \
+            --cmd "set runtimepath+=$PWD" \
+            -c "runtime plugin/reviewtree.lua" \
+            -c "lua require('reviewtree').setup()" \
+            -c "lua assert(vim.fn.exists(':ReviewTree') == 2)" \
+            -c qa
