@@ -25,6 +25,11 @@ jobs:
           version: stable
           neovim: true
 
+      - name: Run Neovim regression tests
+        env:
+          REVIEWTREE_ROOT: ${{ github.workspace }}
+        run: nvim --headless -u NONE -l tests/unit.lua
+
       - name: Smoke-test plugin load
         run: |
           nvim --headless -u NONE \
