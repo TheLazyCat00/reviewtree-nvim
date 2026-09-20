@@ -8,7 +8,13 @@ function M.normalize(path)
   if not path or path == "" then
     return ""
   end
-  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("[\\/]+$", "")
+  local normalized = vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+  -- Trimming a root separator changes the path's meaning: "/" becomes empty
+  -- and "C:\\" becomes "C:". Preserve filesystem roots verbatim.
+  if normalized == "/" or normalized:match("^%a:[\\/]$") then
+    return normalized
+  end
+  return normalized:gsub("[\\/]+$", "")
 end
 
 local function comparable(path)
@@ -25,7 +31,12 @@ function M.is_within(root, path)
   if r == "" or p == "" then
     return false
   end
-  return p == r or p:sub(1, #r + 1) == r .. "/" or p:sub(1, #r + 1) == r .. "\\"
+  if p == r then
+    return true
+  end
+  local sep = r:sub(-1)
+  local prefix = (sep == "/" or sep == "\\") and r or (r .. "/")
+  return p:sub(1, #prefix) == prefix
 end
 
 function M.relpath(root, path)
@@ -37,7 +48,11 @@ function M.relpath(root, path)
   if comparable(root) == comparable(path) then
     return "."
   end
-  return path:sub(#root + 2)
+  local offset = #root + 1
+  if root:sub(-1) ~= "/" and root:sub(-1) ~= "\\" then
+    offset = offset + 1
+  end
+  return path:sub(offset)
 end
 
 function M.slug(value, max_len)
