@@ -1,0 +1,86 @@
+*reviewtree.txt*  Review a Git ref as the post-merge repository tree
+
+==============================================================================
+CONTENTS                                                     *reviewtree-contents*
+
+1. Introduction ........................................ |reviewtree-introduction|
+2. Commands ............................................ |reviewtree-commands|
+3. Review model ........................................ |reviewtree-model|
+4. Configuration ....................................... |reviewtree-configuration|
+
+==============================================================================
+1. INTRODUCTION                                           *reviewtree-introduction*
+
+ReviewTree turns a branch or commit into a persistent, uncommitted post-merge
+working tree. This lets normal Neovim navigation, LSP tooling, and Git signs be
+the review interface instead of an old-vs-new diff viewer.
+
+The current HEAD is the base. The ref passed to `diff` is squash-merged into a
+separate Git worktree. The index is reset so every resulting change is
+unstaged. New files are marked intent-to-add so hunk tools can see them.
+
+Review progress is represented by ordinary local commits on the review branch.
+Commit a reviewed hunk and it stops appearing as a working-tree change.
+
+==============================================================================
+2. COMMANDS                                                   *reviewtree-commands*
+
+:ReviewTree diff {ref}                                    *:ReviewTree-diff*
+        Start or resume a review of {ref} onto the current HEAD. The same
+        base/source commit pair reopens the same persistent session.
+
+:ReviewTree return                                        *:ReviewTree-return*
+        Return to the original checkout. The review worktree, local commits,
+        and uncommitted remainder are preserved.
+
+:ReviewTree status                                        *:ReviewTree-status*
+        Show the current session's immutable base/source commits, local review
+        commit count, and remaining working-tree changes.
+
+:ReviewTree sessions                                    *:ReviewTree-sessions*
+        List persistent ReviewTree sessions for the current Git repository.
+
+:ReviewTree commit [message]                              *:ReviewTree-commit*
+        Commit the currently staged hunks on the local review branch. If no
+        message is supplied, uses `commit_message` from configuration.
+
+:ReviewTree discard[!] [session]                        *:ReviewTree-discard*
+        Permanently remove a review worktree, its local review branch, its
+        base/source tags, and its metadata. Without ! a confirmation is shown.
+
+==============================================================================
+3. REVIEW MODEL                                               *reviewtree-model*
+
+A new session creates these local refs:
+
+    reviewtree/{session}                 review branch
+    reviewtree/{session}/base            initial target HEAD
+    reviewtree/{session}/source          incoming commit
+
+The initial worktree is produced with Git's squash-merge machinery and then a
+mixed reset. Consequently:
+
+    HEAD          reviewed state
+    index         optionally staged reviewed hunks
+    working tree  complete intended merged tree, minus already committed hunks
+
+Nothing is pushed automatically.
+
+==============================================================================
+4. CONFIGURATION                                       *reviewtree-configuration*
+
+setup() is optional. Defaults:
+
+>lua
+    require("reviewtree").setup({
+      worktree_root = vim.fs.joinpath(vim.fn.stdpath("data"), "reviewtree", "worktrees"),
+      state_root = vim.fs.joinpath(vim.fn.stdpath("data"), "reviewtree", "sessions"),
+      branch_prefix = "reviewtree/",
+      tag_prefix = "reviewtree/",
+      open_current_file = true,
+      confirm_discard = true,
+      commit_message = "reviewtree: reviewed hunks",
+    })
+<
+
+vim:tw=78:ts=8:noet:ft=help:norl:
