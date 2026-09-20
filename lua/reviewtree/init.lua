@@ -75,25 +75,74 @@ local function open_review(session_data, origin)
   ))
 end
 
+local function result_detail(result)
+  if not result then
+    return "unknown Git error"
+  end
+  if result.stderr and result.stderr ~= "" then
+    return result.stderr
+  end
+  if result.stdout and result.stdout ~= "" then
+    return result.stdout
+  end
+  return ("exit code %s"):format(tostring(result.code))
+end
+
 local function cleanup_failed_session(root, data)
-  pcall(function()
-    git.worktree_remove(root, data.worktree, true)
-  end)
-  pcall(function()
-    git.worktree_prune(root)
-  end)
-  pcall(function()
-    git.delete_branch(root, data.branch)
-  end)
-  pcall(function()
-    git.delete_tag(root, data.base_tag)
-  end)
-  pcall(function()
-    git.delete_tag(root, data.source_tag)
-  end)
-  pcall(function()
-    session.delete_metadata(data.common_dir, data.id)
-  end)
+  local errors = {}
+
+  if util.file_exists(data.worktree) then
+    local removed = git.worktree_remove(root, data.worktree, true)
+    if removed.code ~= 0 then
+      table.insert(errors, "worktree removal: " .. result_detail(removed))
+    end
+  end
+
+  local pruned = git.worktree_prune(root)
+  if pruned.code ~= 0 then
+    table.insert(errors, "worktree prune: " .. result_detail(pruned))
+  end
+
+  if data.owns_branch and git.ref_exists(root, "refs/heads/" .. data.branch) then
+    local deleted = git.delete_branch(root, data.branch)
+    if deleted.code ~= 0 then
+      table.insert(errors, "branch deletion: " .. result_detail(deleted))
+    end
+  end
+
+  if data.owns_base_tag and git.ref_exists(root, "refs/tags/" .. data.base_tag) then
+    local deleted = git.delete_tag(root, data.base_tag)
+    if deleted.code ~= 0 then
+      table.insert(errors, "base-tag deletion: " .. result_detail(deleted))
+    end
+  end
+
+  if data.owns_source_tag and git.ref_exists(root, "refs/tags/" .. data.source_tag) then
+    local deleted = git.delete_tag(root, data.source_tag)
+    if deleted.code ~= 0 then
+      table.insert(errors, "source-tag deletion: " .. result_detail(deleted))
+    end
+  end
+
+  if #errors == 0 and util.file_exists(session.paths(data.common_dir, data.id).metadata) then
+    local removed, remove_err = session.delete_metadata(data.common_dir, data.id)
+    if not removed then
+      table.insert(errors, "metadata deletion: " .. tostring(remove_err))
+    end
+  end
+
+  return errors
+end
+
+local function creation_error(root, data, message)
+  local cleanup_errors = cleanup_failed_session(root, data)
+  if #cleanup_errors > 0 then
+    error(("%s\nCleanup was incomplete; session metadata was preserved where possible: %s"):format(
+      message,
+      table.concat(cleanup_errors, "; ")
+    ))
+  end
+  error(message)
 end
 
 local function create_session(root, common, source_ref, source_sha, base_sha, base_ref)
@@ -113,6 +162,9 @@ local function create_session(root, common, source_ref, source_sha, base_sha, ba
     base_sha = base_sha,
     source_ref = source_ref,
     source_sha = source_sha,
+    owns_branch = false,
+    owns_base_tag = false,
+    owns_source_tag = false,
     created_at = os.time(),
     last_opened_at = os.time(),
   }
@@ -122,51 +174,64 @@ local function create_session(root, common, source_ref, source_sha, base_sha, ba
   if git.ref_exists(root, "refs/heads/" .. refs.branch) then
     error("reviewtree: session branch already exists without usable metadata: " .. refs.branch)
   end
+  if git.ref_exists(root, "refs/tags/" .. refs.base_tag) or git.ref_exists(root, "refs/tags/" .. refs.source_tag) then
+    error("reviewtree: generated session tag already exists without usable metadata")
+  end
+
+  -- Persist discovery metadata before creating owned Git resources. If cleanup
+  -- later fails, the session remains discoverable instead of becoming orphaned.
+  session.save(common, data)
 
   local added = git.worktree_add(root, refs.branch, paths.worktree, base_sha)
   if added.code ~= 0 then
-    error("reviewtree: couldn't create review worktree: " .. (added.stderr ~= "" and added.stderr or added.stdout))
+    -- worktree add -b may have created the branch before failing.
+    data.owns_branch = git.ref_exists(root, "refs/heads/" .. refs.branch)
+    session.save(common, data)
+    creation_error(root, data, "reviewtree: couldn't create review worktree: " .. result_detail(added))
   end
+  data.owns_branch = true
+  session.save(common, data)
 
   local merged = git.merge_squash(paths.worktree, source_sha)
   if merged.code ~= 0 then
-    cleanup_failed_session(root, data)
-    error("reviewtree: the incoming ref does not squash-merge cleanly onto the current HEAD: " .. (merged.stderr ~= "" and merged.stderr or merged.stdout))
+    creation_error(
+      root,
+      data,
+      "reviewtree: the incoming ref does not squash-merge cleanly onto the current HEAD: " .. result_detail(merged)
+    )
   end
 
   local reset = git.reset_mixed(paths.worktree)
   if reset.code ~= 0 then
-    cleanup_failed_session(root, data)
-    error("reviewtree: couldn't reset the review index: " .. (reset.stderr ~= "" and reset.stderr or reset.stdout))
+    creation_error(root, data, "reviewtree: couldn't reset the review index: " .. result_detail(reset))
   end
 
   local untracked = git.untracked_files(paths.worktree)
-  local ok, intent_err = git.intent_to_add(paths.worktree, untracked)
-  if not ok then
-    cleanup_failed_session(root, data)
-    error("reviewtree: couldn't mark added files as intent-to-add: " .. tostring(intent_err))
+  local intent_ok, intent_err = git.intent_to_add(paths.worktree, untracked)
+  if not intent_ok then
+    creation_error(root, data, "reviewtree: couldn't mark added files as intent-to-add: " .. tostring(intent_err))
   end
 
   if not git.has_changes(paths.worktree) then
-    cleanup_failed_session(root, data)
-    error("reviewtree: this ref produces no changes when merged onto the current HEAD")
+    creation_error(root, data, "reviewtree: this ref produces no changes when merged onto the current HEAD")
   end
 
   local base_tag = git.create_tag(root, refs.base_tag, base_sha)
   if base_tag.code ~= 0 then
-    cleanup_failed_session(root, data)
-    error("reviewtree: couldn't create base tag: " .. (base_tag.stderr ~= "" and base_tag.stderr or base_tag.stdout))
+    creation_error(root, data, "reviewtree: couldn't create base tag: " .. result_detail(base_tag))
   end
+  data.owns_base_tag = true
+  session.save(common, data)
+
   local source_tag = git.create_tag(root, refs.source_tag, source_sha)
   if source_tag.code ~= 0 then
-    cleanup_failed_session(root, data)
-    error("reviewtree: couldn't create source tag: " .. (source_tag.stderr ~= "" and source_tag.stderr or source_tag.stdout))
+    creation_error(root, data, "reviewtree: couldn't create source tag: " .. result_detail(source_tag))
   end
+  data.owns_source_tag = true
 
   local saved, save_err = pcall(session.save, common, data)
   if not saved then
-    cleanup_failed_session(root, data)
-    error(save_err)
+    creation_error(root, data, tostring(save_err))
   end
   return data
 end
@@ -195,12 +260,19 @@ function M.diff(source_ref)
     end
 
     local id = session.id(source_ref, base_sha, source_sha)
-    local existing = session.find_pair(common, base_sha, source_sha) or session.load(common, id)
+    local existing = session.find_pair(common, base_sha, source_sha)
+    if not existing then
+      local by_id = session.load(common, id)
+      if by_id and (by_id.base_sha ~= base_sha or by_id.source_sha ~= source_sha) then
+        error(("reviewtree: session id %s belongs to a different revision pair"):format(id))
+      end
+      existing = by_id
+    end
     local origin = remember_return_state(root)
 
     if existing then
       if not util.file_exists(existing.worktree) then
-        error(("reviewtree: session %s exists but its worktree is missing; discard that session before recreating it"):format(id))
+        error(("reviewtree: session %s exists but its worktree is missing; discard that session before recreating it"):format(existing.id))
       end
       existing.common_dir = common
       open_review(existing, origin)
@@ -335,7 +407,7 @@ function M.commit(message)
     end
     local result = git.commit(active.worktree, msg)
     if result.code ~= 0 then
-      error("reviewtree: commit failed: " .. (result.stderr ~= "" and result.stderr or result.stdout))
+      error("reviewtree: commit failed: " .. result_detail(result))
     end
     vim.cmd("checktime")
     refresh_gitsigns()
@@ -355,20 +427,89 @@ local function find_session_for_discard(id)
   local root, common = repo_context()
   local active = session.current(root)
   if active and (not id or id == "" or id == active.id) then
-    return active, common
+    return active, common, root
   end
   if id and id ~= "" then
     local found = session.load(common, id)
     if found then
-      return found, common
+      return found, common, root
     end
   end
   error("reviewtree: no matching review session")
 end
 
+local function cleanup_cwd(start_root, data)
+  if util.normalize(start_root) ~= util.normalize(data.worktree) and util.file_exists(start_root) then
+    return start_root
+  end
+  if data.origin_root
+    and util.normalize(data.origin_root) ~= util.normalize(data.worktree)
+    and util.file_exists(data.origin_root)
+    and git.root(data.origin_root)
+  then
+    return data.origin_root
+  end
+  for _, path in ipairs(git.worktree_paths(start_root)) do
+    if util.normalize(path) ~= util.normalize(data.worktree) and util.file_exists(path) then
+      return path
+    end
+  end
+  return nil
+end
+
+local function remove_session_resources(data, common, admin_cwd)
+  local errors = {}
+
+  if util.file_exists(data.worktree) then
+    local removed = git.worktree_remove(admin_cwd, data.worktree, true)
+    if removed.code ~= 0 then
+      table.insert(errors, "worktree removal: " .. result_detail(removed))
+    end
+  end
+
+  local pruned = git.worktree_prune(admin_cwd)
+  if pruned.code ~= 0 then
+    table.insert(errors, "worktree prune: " .. result_detail(pruned))
+  end
+
+  if git.ref_exists(admin_cwd, "refs/heads/" .. data.branch) then
+    local deleted = git.delete_branch(admin_cwd, data.branch)
+    if deleted.code ~= 0 then
+      table.insert(errors, "branch deletion: " .. result_detail(deleted))
+    end
+  end
+
+  if git.ref_exists(admin_cwd, "refs/tags/" .. data.base_tag) then
+    local deleted = git.delete_tag(admin_cwd, data.base_tag)
+    if deleted.code ~= 0 then
+      table.insert(errors, "base-tag deletion: " .. result_detail(deleted))
+    end
+  end
+
+  if git.ref_exists(admin_cwd, "refs/tags/" .. data.source_tag) then
+    local deleted = git.delete_tag(admin_cwd, data.source_tag)
+    if deleted.code ~= 0 then
+      table.insert(errors, "source-tag deletion: " .. result_detail(deleted))
+    end
+  end
+
+  if #errors > 0 then
+    return false, table.concat(errors, "; ")
+  end
+
+  local metadata = session.paths(common, data.id).metadata
+  if util.file_exists(metadata) then
+    local removed, remove_err = session.delete_metadata(common, data.id)
+    if not removed then
+      return false, "metadata deletion: " .. tostring(remove_err)
+    end
+  end
+  return true
+end
+
 function M.discard(id, force)
   local ok, err = pcall(function()
-    local data, common = find_session_for_discard(id)
+    local data, common, start_root = find_session_for_discard(id)
     if config.get().confirm_discard and not force then
       local answer = vim.fn.confirm(
         ("Delete ReviewTree session %s?\nThis removes its worktree, local review branch, and local tags."):format(data.id),
@@ -380,24 +521,31 @@ function M.discard(id, force)
       end
     end
 
+    local admin_cwd = cleanup_cwd(start_root, data)
+    if not admin_cwd then
+      error("reviewtree: no other repository worktree is available for cleanup; session metadata was preserved")
+    end
+
     local current = session.current(vim.fn.getcwd())
     if current and current.id == data.id then
-      M.return_to_origin()
-      local still_here = git.root(vim.fn.getcwd())
-      if still_here and util.normalize(still_here) == util.normalize(data.worktree) then
-        error("reviewtree: could not leave the review worktree; session was not deleted")
+      local returned = false
+      if (return_state and return_state.root and util.file_exists(return_state.root))
+        or (data.origin_root and util.file_exists(data.origin_root))
+      then
+        M.return_to_origin()
+        local after = git.root(vim.fn.getcwd())
+        returned = after and util.normalize(after) ~= util.normalize(data.worktree)
+      end
+      if not returned then
+        vim.cmd("enew")
+        vim.cmd("tcd " .. vim.fn.fnameescape(admin_cwd))
       end
     end
 
-    local origin = data.origin_root
-    if origin and util.file_exists(origin) then
-      git.worktree_remove(origin, data.worktree, true)
-      git.worktree_prune(origin)
-      git.delete_branch(origin, data.branch)
-      git.delete_tag(origin, data.base_tag)
-      git.delete_tag(origin, data.source_tag)
+    local removed, cleanup_err = remove_session_resources(data, common, admin_cwd)
+    if not removed then
+      error("reviewtree: cleanup failed; session metadata was preserved: " .. cleanup_err)
     end
-    session.delete_metadata(common, data.id)
     util.notify("Deleted ReviewTree session " .. data.id)
   end)
   if not ok then
