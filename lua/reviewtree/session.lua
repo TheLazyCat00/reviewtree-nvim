@@ -13,12 +13,14 @@ function M.repo_key(common_dir)
 end
 
 function M.id(source_ref, base_sha, source_sha)
-  return table.concat({
-    util.slug(source_ref, 36),
-    util.short_sha(source_sha),
-    "onto",
-    util.short_sha(base_sha),
-  }, "-")
+  local identity = table.concat({
+    tostring(source_ref or ""),
+    "\0",
+    tostring(base_sha or ""),
+    "\0",
+    tostring(source_sha or ""),
+  })
+  return ("%s-%s"):format(util.slug(source_ref, 36), vim.fn.sha256(identity))
 end
 
 function M.paths(common_dir, id)
@@ -78,7 +80,7 @@ end
 
 function M.delete_metadata(common_dir, id)
   local path = M.paths(common_dir, id).metadata
-  pcall(os.remove, path)
+  return os.remove(path)
 end
 
 function M.current(cwd)
